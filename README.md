@@ -1,9 +1,10 @@
 # Credit Card Default Risk Engine: Machine Learning & XAI Analysis
 
-[![R](https://img.shields.io/badge/R-4.x-276DC3.svg?logo=r&logoColor=white)](https://www.r-project.org/)
-[![Tidymodels](https://img.shields.io/badge/Tidymodels-Machine_Learning-276DC3.svg)](https://www.tidymodels.org/)
-[![Random_Forest](https://img.shields.io/badge/Random_Forest-Best_Model_AUC_0.760-green.svg)]()
-[![renv](https://img.shields.io/badge/renv-Package_Management-blue.svg)](https://rstudio.github.io/renv/)
+![Language](https://img.shields.io/badge/Language-R_4.x-276DC3.svg?logo=r&logoColor=white)
+![Framework](https://img.shields.io/badge/Framework-Tidymodels-orange.svg)
+![Domain](https://img.shields.io/badge/Domain-Machine_Learning_%26_XAI-blue.svg)
+![Model](https://img.shields.io/badge/Model-Random_Forest-forestgreen.svg)
+![Metric](https://img.shields.io/badge/Best_AUC-0.760-brightgreen.svg)
 
 ## Project Overview
 
