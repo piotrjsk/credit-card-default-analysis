@@ -1,0 +1,511 @@
+---
+title: "Analiza czynników wpływających na spłatę karty kredytowej"
+author: "Mateusz Panek, Piotr Jasiak"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: paper
+    highlight: tango
+    toc: false
+    number_sections: false
+  pdf_document:
+    toc: false
+subtitle: Raport z projektu zaliczeniowego
+---
+
+<style type="text/css">
+/* --- STYLE CSS (Przywrócone z Twojego pierwszego raportu) --- */
+
+body {
+  font-family: 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  font-size: 14px;
+  text-align: justify;
+  line-height: 1.6;
+  color: #333;
+}
+
+h1 {
+  font-size: 22px !important;
+  font-weight: bold;
+  color: #2c3e50;
+  border-bottom: 2px solid #800080;
+  padding-bottom: 8px;
+  margin-top: 35px;
+  margin-bottom: 20px;
+}
+
+h2 {
+  font-size: 18px !important;
+  color: #800080;
+  font-weight: 600;
+  margin-top: 25px;
+}
+
+h1.title {
+  font-size: 28px !important;
+  color: #2c3e50;
+  text-align: center;
+  margin-bottom: 5px;
+}
+
+h3.subtitle {
+  text-align: center;
+  color: #7f8c8d;
+  font-size: 18px;
+  margin-bottom: 30px;
+}
+
+h4.author, h4.date {
+  text-align: center;
+  font-size: 14px;
+  color: #555;
+}
+
+/* Podział stron dla wydruku */
+.pagebreak { 
+  page-break-before: always; 
+  display: block; 
+  margin: 40px 0;
+  border-bottom: 1px dashed #ddd;
+}
+</style>
+
+```{r setup, include=FALSE}
+# --- KONFIGURACJA R I WCZYTANIE PAKIETÓW ---
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.align = "center", fig.width=8, fig.height=4.5)
+
+library(tidyverse)
+library(tidymodels)
+library(glmnet)
+library(kernlab) 
+library(earth)   
+library(discrim) 
+library(vip)     
+library(grpreg)  
+library(gridExtra)
+library(ranger)
+library(pdp)
+library(randomForestExplainer)
+
+# Ustawienie seed dla powtarzalności
+set.seed(123)
+```
+
+```{r data_loading_and_prep, include=FALSE}
+# --- ETAP 1: Wczytanie i Processing ---
+
+df <- read_csv("data/dane.csv") 
+
+df <- df %>% 
+  rename(default = last_col()) %>%  
+  mutate(default = as.factor(default))
+
+set.seed(123)
+split <- initial_split(df, prop = 0.80, strata = default)
+train_data <- training(split)
+test_data  <- testing(split)
+
+base_rec <- recipe(default ~ ., data = train_data) %>%
+  step_mutate(EDUCATION = ifelse(EDUCATION %in% c(0, 5, 6), 4, EDUCATION)) %>%
+  step_mutate(MARRIAGE = ifelse(MARRIAGE == 0, 3, MARRIAGE)) %>%
+  step_mutate(SEX = as.factor(SEX),
+              EDUCATION = as.factor(EDUCATION),
+              MARRIAGE = as.factor(MARRIAGE)) %>%
+  step_log(starts_with("BILL_AMT"), starts_with("PAY_AMT"), starts_with("LIMIT_BAL"), 
+           offset = 1, signed = TRUE) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors())
+
+prepped_data <- prep(base_rec)
+
+# Dane dla Group Lasso
+train_baked <- bake(prepped_data, new_data = NULL)
+test_baked <- bake(prepped_data, new_data = test_data)
+X_grp <- as.matrix(train_baked %>% dplyr::select(-default))
+y_grp <- as.numeric(train_baked$default) - 1
+X_test_grp <- as.matrix(test_baked %>% dplyr::select(-default))
+groups <- gsub("[_\\.].*", "", colnames(X_grp))
+groups <- gsub("PAY[0-9]", "PAY", groups)
+groups <- gsub("BILL.*", "BILL", groups)
+groups <- gsub("PAY.*AMT.*", "PAY_AMT", groups)
+```
+
+# 1. Cel Projektu i Opis Danych
+
+Zgodnie z treścią zadania, celem projektu jest zbudowanie modelu predykcyjnego, który odpowie na pytanie: **czy klient spłaci swoje zadłużenie na karcie kredytowej w październiku?** (zmienna `default payment next month`). Dla uproszczenia nazwa została zmieniona na `default`.
+
+Analizę przeprowadzono na zbiorze **12 000 obserwacji**. Dane historyczne obejmują okres 6 miesięcy (od kwietnia do września 2005) i zawierają:
+
+* **Zmienne demograficzne:** Limit kredytu (`LIMIT_BAL`), Płeć (`SEX`), Wykształcenie (`EDUCATION`), Stan cywilny (`MARRIAGE`), Wiek (`AGE`).
+* **Statusy płatności (`PAY_0` - `PAY_6`):** Kluczowa informacja o opóźnieniach. Np. `PAY_0` to status za wrzesień, `PAY_2 za sierpień itd.
+* **Historie finansowe:** Kwoty na wyciągach (`BILL_AMT`) oraz kwoty faktycznie wpłacone (`PAY_AMT`).
+
+<div class="pagebreak"></div>
+
+# 2. Eksploracja i Przygotowanie Danych
+
+Przed modelowaniem dane wymagały czyszczenia i transformacji (*Feature Engineering*).
+
+## 2.1 Naprawa anomalii
+W zmiennych kategorycznych zidentyfikowano wartości niezgodne z opisem zadania:
+* `EDUCATION`: wartości 0, 5, 6 (nieopisane w dokumentacji) scalono z kategorią 4 (Others).
+* `MARRIAGE`: wartość 0 scalono z kategorią 3 (Others).
+
+## 2.2 Transformacja zmiennych finansowych
+Zmienne kwotowe (np. limity i rachunki) charakteryzują się silną **asymetrią prawostronną**. Większość klientów ma niskie limity, ale istnieje grupa z bardzo wysokimi kwotami (tzw. długi ogon).
+
+```{r asymetria_wykres, fig.height=3.5, fig.cap="Rozkład limitu kredytowego przed i po logarytmowaniu"}
+p1 <- ggplot(df, aes(x = LIMIT_BAL)) +
+  geom_histogram(bins = 30, fill = "firebrick", color = "white") +
+  labs(title = "Przed: Silna asymetria", x = "Limit", y = "Liczność") +
+  theme_minimal(base_size = 11)
+
+p2 <- ggplot(df, aes(x = log(LIMIT_BAL))) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  labs(title = "Po: Logarytm", x = "Log(Limit)", y = "Liczność") +
+  theme_minimal(base_size = 11)
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+**Decyzja:** Zastosowano transformację logarytmiczną (`signed log`), aby "rozciągnąć" dane. Dzięki temu modele widzą różnice nie tylko u milionerów, ale też u klientów z mniejszym portfelem.
+
+## 2.3 Standaryzacja
+Wszystkie zmienne numeryczne zostały przeskalowane (średnia=0, odchylenie=1). Jest to wymóg techniczny dla algorytmów takich jak SVM czy Lasso.
+
+Logarytmowanie zmiennej `LIMIT_BAL` oraz standaryzacja danych były **niezbędne dla stabilności modeli liniowych** (np. Elastic Net). Modele nieliniowe, takie jak **Random Forest** czy **SVM**, cechują się naturalną odpornością na te zjawiska, jednak ujednolicenie skali pozwala na rzetelne porównanie ich wydajności.
+
+<div class="pagebreak"></div>
+
+## 2.4 Analiza kluczowych zależności (EDA)
+Z punktu widzenia oceny ryzyka, najbardziej aktualne informacje o zachowaniu klienta mają zazwyczaj największą wartość diagnostyczną. Z tego powodu podjęto decyzję o szczegółowej **analizie zmiennej PAY_0** (status płatności w ostatnim miesiącu przed badaniem). Celem tej analizy było sprawdzenie, czy bieżące opóźnienia w spłacie stanowią bezpośredni sygnał ostrzegawczy o nadchodzącym braku płatności (default).
+
+```{r pay0_wykres, fig.height=5, fig.width=8}
+df %>%
+  mutate(default = ifelse(default == 1, "Tak (Default)", "Nie (Spłacone)")) %>%
+  ggplot(aes(x = as.factor(PAY_0), fill = default)) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("#2E8B57", "#D62728")) +
+  labs(title = "Wpływ statusu płatności (PAY_0) na prawdopodobieństwo defaultu",
+       x = "Status płatności w ostatnim miesiącu (PAY_0)",
+       y = "Odsetek dłużników",
+       fill = "Czy Default") +
+  theme_minimal() +
+  theme(
+      plot.title = element_text(face = "bold", size = 14)
+      )
+```
+
+**Wnioski:**
+Wykres potwierdza, że klienci spłacający zobowiązania terminowo **(wartości $\le 0$)** charakteryzują się niskim ryzykiem defaultu. Sytuacja zmienia się drastycznie przy opóźnieniu wynoszącym **2 miesiące i więcej** – w tych grupach odsetek dłużników staje się dominujący, co czyni tę zmienną kluczową dla skuteczności modelu.
+
+```{r modeling_execution, include=FALSE, cache=TRUE}
+# --- ETAP 2: Trenowanie / Wczytanie Modeli ---
+# Budujemy modele, aby wyliczyć pełne statystyki do tabel i wykresów
+set.seed(345)
+cv_folds <- vfold_cv(train_data, v = 5, strata = default)
+
+# Model A: Elastic Net
+glmnet_spec <- logistic_reg(penalty = tune(), mixture = tune()) %>% 
+  set_engine("glmnet") %>% set_mode("classification")
+glmnet_wf <- workflow() %>% add_recipe(base_rec) %>% add_model(glmnet_spec)
+glmnet_res <- tune_grid(glmnet_wf, resamples = cv_folds, grid = grid_space_filling(penalty(), mixture(), size = 10), metrics = metric_set(roc_auc))
+best_glmnet <- select_best(glmnet_res, metric = "roc_auc")
+final_glmnet_fit <- glmnet_wf %>% finalize_workflow(best_glmnet) %>% fit(data = train_data)
+
+# Model B: SVM
+svm_spec <- svm_rbf(cost = tune(), rbf_sigma = tune()) %>% set_engine("kernlab") %>% set_mode("classification")
+svm_wf <- workflow() %>% add_recipe(base_rec) %>% add_model(svm_spec)
+set.seed(999)
+cv_folds_svm <- vfold_cv(train_data, v = 3, strata = default) 
+svm_res <- tune_grid(svm_wf, resamples = cv_folds_svm, grid = grid_regular(cost(), rbf_sigma(), levels = 3), metrics = metric_set(roc_auc))
+best_svm <- select_best(svm_res, metric = "roc_auc")
+final_svm_fit <- svm_wf %>% finalize_workflow(best_svm) %>% fit(data = train_data)
+
+# Model C: FDA
+fda_spec <- discrim_flexible(num_terms = tune(), prod_degree = tune()) %>% set_engine("earth") %>% set_mode("classification")
+fda_wf <- workflow() %>% add_recipe(base_rec) %>% add_model(fda_spec)
+fda_res <- tune_grid(fda_wf, resamples = cv_folds, grid = grid_regular(num_terms(range = c(5, 30)), prod_degree(), levels = 5), metrics = metric_set(roc_auc))
+best_fda <- select_best(fda_res, metric = "roc_auc")
+final_fda_fit <- fda_wf %>% finalize_workflow(best_fda) %>% fit(data = train_data)
+
+# Model D: Random Forest (Winner)
+final_rf_fit <- readRDS("model_finalny.rds")
+
+# Group Lasso
+cv_grpreg <- cv.grpreg(X = X_grp, y = y_grp, group = groups, penalty = "grLasso", family = "binomial", nfolds = 5)
+
+# Predykcje (Poprawka dplyr::select)
+results_rf <- predict(final_rf_fit, new_data = test_data, type = "prob") %>% bind_cols(test_data %>% dplyr::select(default)) %>% mutate(model = "Random Forest")
+results_fda <- predict(final_fda_fit, new_data = test_data, type = "prob") %>% bind_cols(test_data %>% dplyr::select(default)) %>% mutate(model = "FDA (MARS)")
+results_glmnet <- predict(final_glmnet_fit, new_data = test_data, type = "prob") %>% bind_cols(test_data %>% dplyr::select(default)) %>% mutate(model = "Elastic Net")
+results_svm <- predict(final_svm_fit, new_data = test_data, type = "prob") %>% bind_cols(test_data %>% dplyr::select(default)) %>% mutate(model = "SVM")
+pred_grpreg <- predict(cv_grpreg, X = X_test_grp, lambda = cv_grpreg$lambda.min, type = "response")
+results_grpreg <- tibble(.pred_0 = 1 - as.numeric(pred_grpreg), .pred_1 = as.numeric(pred_grpreg), default = test_data$default, model = "Group Lasso")
+
+all_results <- bind_rows(results_rf, results_fda, results_glmnet, results_svm, results_grpreg)
+```
+
+<div class="pagebreak"></div>
+
+# 3. Wyniki Modelowania
+
+## 3.1 Dobór Metryki
+Ze względu na **niezbalansowanie klas** (tylko około 23% niespłacających), standardowa **Dokładność (Accuracy)** byłaby metryką mylącą. Gdyby model przewidywał, że **każdy** klient spłaci kredyt, osiągnąłby aż **77% dokładności**, będąc jednocześnie bezużytecznym biznesowo. Z tego powodu wybrano:
+
+1. **AUC (Pole pod krzywą ROC):** Jest **odporna na dysproporcje** i mierzy ogólną zdolność modelu do **rankingu ryzyka**. AUC = 0.75 oznacza, że w 75% przypadków model poprawnie oceni losowego dłużnika jako bardziej ryzykownego niż rzetelnego klienta.
+
+2. **F1-Score:** Średnia harmoniczna precyzji i czułości (Recall). Podczas gdy AUC ocenia model na wszystkich możliwych progach, F1-Score mówi o skuteczności binarnej decyzji. W niniejszej analizie, zamiast standardowego progu 0.5, **zastosowano próg 0.3**. Decyzja ta wynika z asymetrii kosztów w bankowości – koszt przeoczenia dłużnika jest wielokrotnie wyższy niż koszt błędnej odmowy kredytu rzetelnemu klientowi.
+
+<div class="pagebreak"></div>
+
+## 3.2 Ranking Modeli (Zbiór Testowy)
+Poniżej zestawiono wyniki skuteczności przetestowanych algorytmów przy zastosowaniu progu **0.3**:
+
+```{r metrics_table}
+get_model_stats <- function(results_data, name) {
+  auc_val <- results_data %>% roc_auc(truth = default, .pred_1, event_level = "second")
+  f1_val <- results_data %>% 
+    mutate(.pred_class = as.factor(ifelse(.pred_1 >= 0.3, 1, 0))) %>%
+    f_meas(truth = default, estimate = .pred_class, event_level = "second")
+  tibble(Model = name, AUC = auc_val$.estimate, `F1 Score (0.3)` = f1_val$.estimate)
+}
+
+final_summary <- bind_rows(
+  get_model_stats(results_rf, "Random Forest"),
+  get_model_stats(results_fda, "FDA (MARS)"),
+  get_model_stats(results_glmnet, "Elastic Net"),
+  get_model_stats(results_grpreg, "Group Lasso"),
+  get_model_stats(results_svm, "SVM")
+) %>% arrange(desc(AUC))
+
+knitr::kable(final_summary, caption = "Porównanie AUC oraz F1 Score (próg 0.3) na zbiorze testowym", digits = 3)
+```
+
+1. **Random Forest** – Zwycięzca projektu. Wykazuje najwyższą zdolność do wykrywania złożonych wzorców dzięki agregacji setek drzew decyzyjnych. Uzyskał on również najwyższy F1-Score (0.525).
+2. **FDA (MARS)** – Bardzo solidny model nieliniowy, ustępujący liderowi jedynie o 0.4 pkt procentowego w AUC.
+3. **Elastic Net** – Solidny wynik, ale model zakłada liniowość ryzyka, co ogranicza jego skuteczność.
+4. **SVM (Radial)** – Model okazał się najmniej skuteczny pod kątem AUC na tym zbiorze danych.
+
+<div class="pagebreak"></div>
+
+## 3.3 Porównanie Krzywych ROC
+Poniższy wykres wizualizuje wydajność modeli. Krzywa dla modelu **Random Forest** (fioletowa) potwierdza jego zdolność do utrzymania najwyższej czułości przy niższym odsetku fałszywych alarmów.
+
+```{r comparison_roc, fig.height=5, fig.width=8}
+model_colors <- c("Random Forest" = "#800080", "FDA (MARS)" = "#2E8B57", "Elastic Net" = "#1F77B4", "Group Lasso" = "#FF7F0E", "SVM" = "#D62728")
+
+all_results %>%
+  group_by(model) %>%
+  roc_curve(truth = default, .pred_1, event_level = "second") %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = model)) +
+  geom_abline(lty = 2, color = "gray50", size = 0.8) +
+  geom_path(size = 1, alpha = 0.8) +
+  scale_color_manual(values = model_colors) +
+  labs(title = "Porównanie Wydajności Modeli (Krzywe ROC)", x = "1 - Specyficzność", y = "Czułość", color = "Model") +
+  theme_light() + theme(legend.position = "bottom") + coord_equal()
+```
+
+<div class="pagebreak"></div>
+
+# 4. Analiza Zwycięskiego Modelu: Random Forest
+
+## 4.1 Charakterystyka modelu
+
+**Model Random Forest** został wybrany jako rozwiązanie finalne ze względu na wysoką odporność na przeuczenie i optymalne parametry decyzyjne. Algorytm ten efektywnie przetwarza dane bez rygorystycznych założeń o ich rozkładzie, co przy analizie statusów płatności daje mu przewagę nad metodami regresyjnymi.
+
+Jako algorytm zespołowy, Random Forest buduje **wiele niezależnych drzew decyzyjnych** na losowych podzbiorach danych, a następnie **agreguje** ich wyniki. Mechanizm ten redukuje ryzyko overfittingu i zwiększa stabilność prognoz. Dzięki równoległemu losowaniu obserwacji oraz cech, model skutecznie izoluje szum w danych kredytowych i identyfikuje złożone, nieliniowe zależności między zmiennymi.
+
+**Finalne parametry modelu:**
+
+1. **Liczba drzew (trees):** Ustalona na **300**, co stanowi optymalny balans między stabilnością błędu OOB a wydajnością obliczeniową.
+2. **Liczba cech (mtry):** Każdy podział w drzewie wybierany jest spośród **2** losowo wskazanych zmiennych, co minimalizuje korelacje między drzewami i zwiększa ich różnorodność.
+3. **Minimalna wielkość węzła (node_size):** Próg **20** obserwacji zapobiega tworzeniu zbyt płytkich podziałów, wymuszając na modelu naukę bardziej ogólnych reguł zamiast zapamiętywania pojedynczych rekordów.
+4. **Kryterium podziału (splitrule):** Zastosowano wskaźnik **Gini** (impurity), który precyzyjnie mierzy czystość węzłów przy każdym rozgałęzieniu drzewa.
+5. **Błąd OOB (Brier Score):** Wynik na poziomie **0.1456** świadczy o bardzo dobrej kalibracji prawdopodobieństwa i trafności prognoz modelu na danych niewidocznych.
+
+
+## 4.2 Wyjaśnienie ważności zmiennych (VIP)
+**Ważność zmiennych** to miara określająca, w jakim stopniu każda z cech przyczyniła się do poprawy trafności klasyfikacji i redukcji niepewności modelu w procesie podejmowania decyzji
+
+**Metodologia:** Wykres ważności zmiennych został wyliczony metodą **Gini Impurity.** W algorytmie Random Forest każde drzewo uczy się poprzez ciągłe dzielenie danych na **coraz "czystsze" grupy** (czyli takie, w których dominują albo sami dłużnicy, albo sami klienci spłacający terminowo).
+
+<div class="pagebreak"></div>
+
+```{r vip_plot, fig.height=5, fig.width=8}
+rf_obj <- extract_fit_engine(final_rf_fit)
+
+# Wykres ważności predyktorów dla Random Forest
+vip(rf_obj, num_features = 12, geom = "col", aesthetics = list(fill = "#800080", width = 0.7)) +
+  # Dodanie etykiet tekstowych na słupkach
+  geom_text(aes(label = round(Importance, 1)), 
+            hjust = -0.2, size = 3.5, color = "#800080") +
+  # Rozszerzenie osi
+  expand_limits(y = c(0, max(vi(rf_obj)$Importance) * 1.1)) +
+  labs(title = "Analiza ważności zmiennych VIP (Model Random Forest)", 
+       y = "Wskaźnik istotności", 
+       x = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(face = "bold"),
+    axis.text.y = element_text(face = "bold")
+  )
+```
+
+## 4.3 Jak powstaje wynik na wykresie?
+1. **Zysk informacyjny:** Przy każdym podziale danych model sprawdza, o ile dana zmienna (np. PAY_0) pomogła uporządkować zbiór i zmniejszyć w nim chaos (nieczystość).
+2. **Sumowanie zasług:** Wynik widoczny na osi X to suma wszystkich takich poprawek, jakie dana zmienna wniosła we wszystkich 300 drzewach.
+3. **Wniosek:** Im wyższy słupek, tym częściej i skuteczniej zmienna ta pozwalała modelowi poprawnie rozpoznać dłużnika.
+
+W ujęciu matematycznym, ważność zmiennej $X_j$ (Variable Importance) jest definiowana jako suma spadku zanieczyszczenia (Gini Impurity) we wszystkich węzłach $\tau$, w których dokonano podziału względem tej zmiennej, uśredniona po wszystkich drzewach w lesie:$$VI(X_j) = \frac{1}{N_{trees}} \sum_{T} \sum_{\tau \in T: v(\tau)=X_j} \Delta i(\tau, X_j)$$Gdzie: $\Delta i(\tau, X_j)$ to redukcja nieczystości Giniego w węźle $\tau$ po dokonaniu podziału. $v(\tau)=X_j$ oznacza, że zmienna $X_j$ została wybrana jako optymalny predyktor w danym węźle. $N_{trees}$ to całkowita liczba drzew w modelu.
+
+<div class="pagebreak"></div>
+
+## 4.3 Interpretacja Biznesowa
+1. **Dominacja PAY_0 (Wrzesień):** Status płatności z ostatniego miesiąca posiada absolutnie największą wartość diagnostyczną (wskaźnik istotności **213.5**). Potwierdza to hipotezę, że najświeższa dyscyplina płatnicza klienta jest kluczowym prognostykiem jego przyszłej wypłacalności.
+2. **Historia Behawioralna:** Istotne znaczenie mają również statusy z sierpnia (`PAY_2`) oraz kwoty ostatnich wyciągów (`BILL_AMT1`) i wpłat (`PAY_AMT1`).
+3. **Marginalna rola demografii:** Model niemal całkowicie ignoruje zmienne demograficzne, co czyni proces oceny ryzyka bardziej obiektywnym i skupionym na faktach finansowych.
+
+
+## 4.4 Wizualizacja działania modelu (Scatter plot)
+Zrozumienie, w jaki sposób model Lasu Losowego podejmuje decyzje, wymaga wyjścia poza proste statystyki. W tym celu zastosowano **scatterplot z nałożoną granicą decyzyjną** dla dwóch kluczowych zmiennych zidentyfikowanych w rankingu VIP: `PAY_0` oraz `BILL_AMT1`.
+
+**Dlaczego te dwie zmienne?** 
+Wybrano je, ponieważ reprezentują dwa najważniejsze wymiary ryzyka:
+
+1. **Wymiar Behawioralny (Zachowanie)** - zmienna `PAY_0`: Mówi nam o aktualnej dyscyplinie płatniczej klienta.
+2. **Wymiar Ekspozycji (Skala)** - zmienna `BILL_AMT1`: Określa bieżącą wysokość rachunku, czyli faktyczne obciążenie finansowe klienta.
+
+Dzięki ich zestawieniu na wykresie możemy sprawdzić, jak model dopasowuje **próg tolerancji na opóźnienia** w zależności od **wysokości długu**, co najlepiej obrazuje **nieliniową** naturę algorytmu oraz wykrytą wcześniej siłę interakcji między tymi parametrami.
+
+<div class="pagebreak"></div>
+
+
+
+
+
+```{r scatter_plot, fig.height=5, fig.width=8}
+
+# Generowanie siatki prawdopodobieństwa (Partial Dependence Plot 2D)
+pd_2d <- partial(rf_obj, 
+                 pred.var = c("PAY_0", "BILL_AMT1"), 
+                 grid.resolution = 30, 
+                 train = train_baked,
+                 prob = TRUE,
+                 which.class = 2)
+
+
+# 1. Wyliczamy parametry do "odkręcenia" normalizacji (tylko dla osi X na wykresie)
+m_pay <- mean(df$PAY_0, na.rm = TRUE)
+s_pay <- sd(df$PAY_0, na.rm = TRUE)
+
+ggplot() +
+  # WARSTWA 1: Mapa prawdopodobieństwa - odkręcamy normalizację dla PAY_0
+  geom_tile(data = pd_2d, 
+            aes(x = (PAY_0 * s_pay) + m_pay, y = BILL_AMT1, fill = yhat), 
+            alpha = 0.7, width = 1) + 
+  scale_fill_gradientn(colors = c("green3", "yellow", "red2"), 
+                       name = "P-stwo\ndefaultu") +
+  
+  # WARSTWA 2: Punkty - tutaj również odkręcamy normalizację dla PAY_0
+  geom_jitter(data = test_baked, 
+              aes(x = (PAY_0 * s_pay) + m_pay, y = BILL_AMT1, color = as.factor(default)), 
+              alpha = 0.8, size = 1.8, width = 0.2) + 
+  
+  scale_color_manual(values = c("0" = "darkgreen", "1" = "darkred"), 
+                     name = "Rzeczywisty\nstatus (Test)",
+                     labels = c("Spłata", "Default")) +
+  
+  # Ustawiamy limity osi na wartości NATURALNE (oryginalne)
+  scale_x_continuous(
+    breaks = seq(-2, 8, by = 1), 
+    limits = c(-2.5, 8.5),
+    expand = c(0, 0)
+  ) +
+  
+  theme_minimal() +
+  labs(title = "Weryfikacja modelu: Interakcja PAY_0 i BILL_AMT1",
+       subtitle = "Skala przywrócona do wartości oryginalnych (uskok na PAY_0 = 2)",
+       x = "Status płatności (PAY_0)",
+       y = "Kwota rachunku (BILL_AMT1)") +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+```
+
+## 4.5 Interpretacja wykresu i analiza interakcji
+Wizualizacja tła (gradientu) przedstawia logikę decyzyjną modelu: przejście od koloru zielonego do czerwonego wyznacza **wzrost prawdopodobieństwa niewypłacalności klienta.** Nałożenie realnych punktów testowych na mapę prawdopodobieństwa pozwala ocenić skuteczność klasyfikacji w praktyce.
+
+1. **Nieliniowa granica decyzyjna:** Wykres wyraźnie pokazuje, że granica ryzyka **nie jest linią prostą.** Największy "uskok" następuje przy wartości `PAY_0 = 2`. Model identyfikuje dwumiesięczne opóźnienie jako krytyczny próg ryzyka, po przekroczeniu którego prawdopodobieństwo defaultu drastycznie rośnie.
+2. **Występowanie interakcji:** Kluczowym wnioskiem z wykresu jest fakt, że wpływ zmiennej PAY_0 na ocenę ryzyka jest modulowany przez wysokość `BILL_AMT1`. Można zauważyć, że próg alarmowy dla zmiennej `PAY_0` **nie jest stały, lecz przesuwa się dynamicznie wraz ze wzrostem** `BILL_AMT1`.
+3. **Trafność klasyfikacji:** Wysoka zbieżność między rzeczywistymi zdarzeniami kredytowymi a mapą ryzyka wygenerowaną przez Random Forest pokazuje, że **model z dużą precyzją wyodrębnił kluczowe obszary**, w których kumuluje się największe prawdopodobieństwo braku spłaty.
+
+<div class="pagebreak"></div>
+
+## 4.6 Analiza siły interakcji (H-statistic)
+Aby ostatecznie potwierdzić, czy model Random Forest wykorzystuje **głębokie, nieliniowe zależności**, przeprowadzono analizę **statystyką H Friedmana.** Pozwala ona matematycznie zmierzyć, w jakim stopniu prognoza modelu wynika z wzajemnego oddziaływania par zmiennych (interakcji), a nie tylko z ich sumarycznego działania.
+
+Do analizy wybrano **Top 4 najważniejszych zmiennych** (według rankingu VIP), co pozwoliło na zbadanie kluczowych relacji przy jednoczesnym zachowaniu czytelności wyników i stabilności obliczeniowej.
+
+Wartości statystyki H Friedmana określają, jaki procent zmienności prognoz modelu wynika z **wzajemnego oddziaływania** pary zmiennych, a nie z każdej z nich osobno. Wynik zbliżony do 0.5 oznacza, że aż połowa wpływu tych cech na ryzyko defaultu zależy od ich interakcji, co potwierdza wysoką nieliniowość modelu.
+
+```{r interact_plot, fig.height=5, fig.width=8}
+
+top_4_vars <- vi(rf_obj) %>% 
+  top_n(4, wt = Importance) %>% 
+  pull(Variable)
+
+# 2. Automatyczne pary
+pary <- split(combn(top_4_vars, 2), col(combn(top_4_vars, 2)))
+
+# 3. Obliczenia i sumowanie (pętla)
+interact_list <- lapply(pary, function(p) {
+  res <- vi_firm(rf_obj, feature_names = p, train = train_baked, interaction = TRUE)
+  data.frame(
+    Para = paste(p, collapse = " & "),
+    Suma_H_stat = sum(res$Importance)
+  )
+})
+
+# 4. Finalna tabela i wykres
+interact_df <- bind_rows(interact_list)
+
+ggplot(interact_df, aes(x = Suma_H_stat, y = reorder(Para, Suma_H_stat))) +
+  geom_col(fill = "#1a5276", width = 0.6) +
+  geom_text(aes(label = round(Suma_H_stat, 3)), 
+            hjust = -0.2, 
+            fontface = "bold", 
+            size = 3.5) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) + 
+  theme_minimal() +
+  labs(title = "Siła interakcji między kluczowymi zmiennymi",
+       subtitle = "Automatyczna analiza kombinacji Top 4 predyktorów",
+       x = "Suma H-stat", 
+       y = "Para zmiennych") +
+  theme(
+    axis.text.y = element_text(size = 9),
+    plot.title = element_text(face = "bold"),
+  )
+```
+
+<div class="pagebreak"></div>
+
+## 4.7 Wnioski z analizy interakcji:
+1. **Potwierdzenie nieliniowości:** Wysokie wartości statystyki H dla czołowych par zmiennych są bezpośrednim dowodem na to, że Random Forest **buduje złożone reguły decyzyjne.** W modelach liniowych interakcje te musiałyby zostać zdefiniowane ręcznie, tutaj algorytm wykrył je samodzielnie.
+2. **Interakcja** `PAY_0` **i** `BILL_AMT1`**:** Obecność tej pary w czołówce rankingu potwierdza obserwacje ze scatter plota.
+3. **Zależności sekwencyjne (**`PAY_0` **i** `PAY_2`**):** Wysoka pozycja interakcji między statusem płatności z września i sierpnia sugeruje, że model analizuje **historyczną powtarzalność** opóźnień.
+
+**Uwaga metodologiczna:** Zamiast analizować setki skomplikowanych drzew z osobna, użyliśmy nowoczesnych metod wyjaśniania modeli: **ranking VIP, mapa granicy decyzyjnej i statystykę H Friedmana.** Pozwalają one w prosty sposób zrozumieć, jak model podejmuje decyzje i jakie zależności są dla niego kluczowe, co jest znacznie bardziej użyteczne niż przeglądanie tysięcy pojedynczych reguł.
+
+
+# 5. Podsumowanie i wnioski końcowe
+## Analiza potwierdziła wysoką skuteczność modelu Random Forest w ocenie ryzyka kredytowego. 
+## Główne wnioski to:
+1. **Skuteczność nieliniowa:** Model Random Forest znacząco przewyższa metody liniowe dzięki zdolności do samodzielnego wykrywania złożonych zależności między cechami klienta.
+2. **Kluczowe czynniki:** Największy wpływ na prognozę ma bieżąca dyscyplina płatnicza (PAY_0), szczególnie w połączeniu z historią z poprzednich miesięcy oraz limitem kredytowym.
+3. **Obiektywizm i dane:** Proces decyzyjny opiera się na twardych danych behawioralnych (historia spłat), niemal całkowicie pomijając cechy demograficzne, co zapewnia obiektywizm oceny.
+4. **Praktyczne zastosowanie:** Dzięki zastosowaniu metod XAI (ranking VIP, mapa granicy decyzyjnej, statystyka H) udowodniono, że logika modelu jest przejrzysta i spójna, co pozwala bankowi precyzyjnie oddzielać incydentalne opóźnienia od realnego ryzyka niewypłacalności.

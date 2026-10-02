@@ -1,0 +1,25 @@
+# --- R History & Pliki tymczasowe ---
+.Rhistory
+.RData
+.RDataTmp
+.Ruserdata
+*.Rproj.user
+
+# --- Środowisko renv ---
+renv/library/
+renv/python/
+renv/staging/
+
+# --- Pliki tymczasowe z RMarkdown / LaTeX ---
+*.utf8.md
+*.knit.md
+*.log
+*.aux
+*.out
+*.toc
+*_files/
+
+# --- Pliki systemowe i VS Code ---
+.vscode/
+.DS_Store
+Thumbs.db
