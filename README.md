@@ -88,7 +88,7 @@ All models were evaluated on an independent test dataset using a **0.30 threshol
 │   └── modeling_and_analysis.R # Core ML training, evaluation & XAI script
 │
 ├── models/
-│   └── final_model.rds       # Serialized Random Forest model object
+│   └── final_model.rds      # Serialized Random Forest model object
 │
 ├── reports/
 │  ├── analysis_report.Rmd   # Source RMarkdown analysis document
