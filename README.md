@@ -107,6 +107,7 @@ All models were evaluated on an independent test dataset using a **0.30 threshol
 ## Installation & Execution
 
 ```bash
+# Clone the repository
 git clone https://github.com/piotrjsk/credit-card-default-analysis.git
 cd credit-card-default-analysis
 
